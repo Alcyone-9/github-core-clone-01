@@ -177,9 +177,23 @@ function storeObject(repo: Repo, type: string, data: Buffer): string {
   return oid;
 }
 
-function getCommit(repo: Repo, oid: string): { tree: string; parents: string[]; author: string; committer: string; message: string } | null {
+interface ParsedCommit {
+  tree: string;
+  parents: string[];
+  author: string;
+  committer: string;
+  message: string;
+}
+
+/** Parse caches: a stored git object's bytes never change, so a parse keyed by its buffer stays valid. */
+const commitParseCache = new WeakMap<Buffer, ParsedCommit>();
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+
+function getCommit(repo: Repo, oid: string): ParsedCommit | null {
   const object = repo.objects.get(oid);
   if (object === undefined || object.type !== 'commit') return null;
+  const cached = commitParseCache.get(object.data);
+  if (cached !== undefined) return cached;
   const text = object.data.toString('utf8');
   const split = text.indexOf('\n\n');
   const head = split < 0 ? text : text.slice(0, split);
@@ -194,7 +208,9 @@ function getCommit(repo: Repo, oid: string): { tree: string; parents: string[]; 
     else if (line.startsWith('author ')) author = line.slice(7);
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
-  return { tree, parents, author, committer, message };
+  const parsed: ParsedCommit = { tree, parents, author, committer, message };
+  commitParseCache.set(object.data, parsed);
+  return parsed;
 }
 
 function buildCommitData(tree: string, parents: readonly string[], author: string, committer: string, message: string): Buffer {
@@ -218,6 +234,8 @@ interface TreeEntry {
 }
 
 function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeParseCache.get(data);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -229,6 +247,7 @@ function parseTree(data: Buffer): TreeEntry[] {
     entries.push({ mode, name, oid });
     offset = nul + 21;
   }
+  treeParseCache.set(data, entries);
   return entries;
 }
 
@@ -336,7 +355,24 @@ function ancestorSet(repo: Repo, tip: string): Set<string> {
 }
 
 function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
-  return ancestorSet(repo, descendant).has(ancestor);
+  // Membership only: walk from the descendant and stop the moment the ancestor turns up,
+  // instead of materialising the descendant's whole ancestor set first.
+  const seen = new Set<string>();
+  const stack = [descendant];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (oid === ancestor) {
+      const object = repo.objects.get(oid);
+      if (object !== undefined && object.type === 'commit') return true;
+      continue;
+    }
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const commit = getCommit(repo, oid);
+    if (commit === null) continue;
+    for (const parent of commit.parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** The nearest common ancestor of two commits, or null. */
@@ -705,6 +741,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.end(text);
 }
 
+function sendJsonText(res: ServerResponse, status: number, text: string, bytes?: number): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': bytes ?? Buffer.byteLength(text) });
+  res.end(text);
+}
+
 function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
   res.end(body);
@@ -791,19 +832,22 @@ function decodeSegment(segment: string): string {
 // ------------------------------------------------------------------------------------------------
 // REST serializers
 
+/** The viewer's JSON is constant; one shared object is stringified into every response that embeds it. */
+const VIEWER_JSON: Record<string, unknown> = {
+  login: VIEWER.login,
+  id: VIEWER.id,
+  node_id: globalId('User', VIEWER.id),
+  type: 'User',
+  site_admin: false,
+  name: VIEWER.name,
+  email: VIEWER.email,
+  avatar_url: '',
+  url: `/api/v3/users/${VIEWER.login}`,
+  html_url: `/${VIEWER.login}`,
+};
+
 function userJson(): Record<string, unknown> {
-  return {
-    login: VIEWER.login,
-    id: VIEWER.id,
-    node_id: globalId('User', VIEWER.id),
-    type: 'User',
-    site_admin: false,
-    name: VIEWER.name,
-    email: VIEWER.email,
-    avatar_url: '',
-    url: `/api/v3/users/${VIEWER.login}`,
-    html_url: `/${VIEWER.login}`,
-  };
+  return VIEWER_JSON;
 }
 
 function repoJson(repo: Repo): Record<string, unknown> {
@@ -877,6 +921,24 @@ function issueJson(repo: Repo, issue: IssueRec): Record<string, unknown> {
     html_url: `/${repo.owner}/${repo.name}/issues/${issue.number}`,
     repository_url: `/api/v3/repos/${repo.owner}/${repo.name}`,
   };
+}
+
+/**
+ * Serialized issue bodies for the single-issue GET: an issue's JSON depends only on its own fields
+ * (every mutation path bumps updatedAt), the repo's name, and its comment count (labels resolve to
+ * immutable label records), so a body stamped with those three is safe to reuse verbatim.
+ */
+const issueTextCache = new WeakMap<IssueRec, { stamp: string; text: string; bytes: number }>();
+
+function issueJsonText(repo: Repo, issue: IssueRec): { text: string; bytes: number } {
+  const comments = (repo.comments.get(issue.number) ?? []).length;
+  const stamp = `${repo.owner}/${repo.name}|${issue.updatedAt}|${comments}`;
+  const hit = issueTextCache.get(issue);
+  if (hit !== undefined && hit.stamp === stamp) return hit;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  const entry = { stamp, text, bytes: Buffer.byteLength(text) };
+  issueTextCache.set(issue, entry);
+  return entry;
 }
 
 function pullJson(repo: Repo, pull: PullRec): Record<string, unknown> {
@@ -1451,7 +1513,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, s
       const pull = repo.pulls.get(number);
       if (method === 'GET') {
         if (issue !== undefined) {
-          sendJson(res, 200, issueJson(repo, issue));
+          const body = issueJsonText(repo, issue);
+          sendJsonText(res, 200, body.text, body.bytes);
           return;
         }
         if (pull !== undefined) {
@@ -1684,18 +1747,20 @@ function advertisementRefs(repo: Repo, service: string): Buffer {
   return Buffer.concat(lines);
 }
 
+/** The protocol-v2 capability advertisement never changes; build it once. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${GIT_AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, service: string): void {
   const protocol = req.headers['git-protocol'];
   if (service === 'git-upload-pack' && typeof protocol === 'string' && protocol.includes('version=2')) {
-    const body = Buffer.concat([
-      pktLine('version 2\n'),
-      pktLine(`agent=${GIT_AGENT}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow\n'),
-      pktLine('object-format=sha1\n'),
-      PKT_FLUSH,
-    ]);
-    sendBuffer(res, 200, body, 'application/x-git-upload-pack-advertisement');
+    sendBuffer(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     return;
   }
   const body = Buffer.concat([pktLine(`# service=${service}\n`), PKT_FLUSH, advertisementRefs(repo, service), PKT_FLUSH]);
@@ -1790,9 +1855,14 @@ function planFetch(repo: Repo, wants: string[], haves: string[], depth: number |
       }
     }
   }
+  // A depth-bounded fetch with no haves and no client shallow boundary cannot include, unshallow
+  // or acknowledge anything past generation depth-1, so the walk stops there instead of touring
+  // the whole history. With haves or a shallow boundary the full walk still runs (deepen needs it).
+  const maxGen = depth !== null && haves.length === 0 && clientShallow.length === 0 ? depth - 1 : Number.POSITIVE_INFINITY;
   const boundary = new Set<string>();
-  while (queue.length > 0) {
-    const { oid, gen } = queue.shift()!;
+  let queueHead = 0;
+  while (queueHead < queue.length) {
+    const { oid, gen } = queue[queueHead++]!;
     if (generations.get(oid) !== gen) continue;
     const object = repo.objects.get(oid);
     if (object === undefined) continue;
@@ -1822,7 +1892,10 @@ function planFetch(repo: Repo, wants: string[], haves: string[], depth: number |
         }
       }
       // Parents are always traversed: depth is measured through haves too (deepen).
-      for (const parent of commit.parents) enqueue(parent, gen + 1);
+      for (const parent of commit.parents) {
+        if (gen + 1 > maxGen) continue;
+        enqueue(parent, gen + 1);
+      }
     } else if (object.type === 'tree') {
       if (!haveClosure.has(oid) && !included.has(oid)) {
         included.add(oid);
@@ -1857,6 +1930,19 @@ function planFetch(repo: Repo, wants: string[], haves: string[], depth: number |
   };
 }
 
+/** Pack bytes are a pure function of the object list (content-addressed), so repeat fetches reuse them. */
+const packCache = new Map<string, Buffer>();
+
+function packForObjects(objects: ReadonlyArray<{ oid: string; type: string; data: Buffer }>): Buffer {
+  const key = objects.map((object) => object.oid).join(' ');
+  const hit = packCache.get(key);
+  if (hit !== undefined) return hit;
+  const pack = buildPack(objects);
+  if (packCache.size >= 32) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
+}
+
 function fetchResponse(repo: Repo, wants: string[], haves: string[], depth: number | null, clientShallow: string[], done: boolean): Buffer {
   const parts: Buffer[] = [];
   const plan = planFetch(repo, wants, haves, depth, clientShallow);
@@ -1877,7 +1963,7 @@ function fetchResponse(repo: Repo, wants: string[], haves: string[], depth: numb
     for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
     parts.push(PKT_DELIM);
   }
-  const pack = buildPack(plan.objects);
+  const pack = packForObjects(plan.objects);
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandChunks(pack));
   parts.push(PKT_FLUSH);
@@ -1931,7 +2017,7 @@ function handleUploadPack(res: ServerResponse, repo: Repo, rawBody: Buffer): voi
       else if (clean.startsWith('deepen ')) depth = Number(clean.slice(7).trim());
     }
     const plan = planFetch(repo, wants, haves, depth, []);
-    const pack = buildPack(plan.objects);
+    const pack = packForObjects(plan.objects);
     const body = Buffer.concat([pktLine('NAK\n'), ...sidebandChunks(pack), PKT_FLUSH]);
     sendBuffer(res, 200, body, 'application/x-git-upload-pack-result');
     return;
