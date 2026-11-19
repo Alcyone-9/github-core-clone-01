@@ -678,9 +678,10 @@ function parsePack(pack: Buffer, external?: (oid: string) => GitObject | undefin
 
 function pktLine(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const length = body.length + 4;
-  const head = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, body]);
+  const out = Buffer.allocUnsafe(body.length + 4);
+  out.write((body.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  body.copy(out, 4);
+  return out;
 }
 
 const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -727,7 +728,11 @@ function sidebandChunks(pack: Buffer): Buffer[] {
   const SIZE = 65512;
   for (let offset = 0; offset < pack.length; offset += SIZE) {
     const slice = pack.subarray(offset, Math.min(pack.length, offset + SIZE));
-    chunks.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    const framed = Buffer.allocUnsafe(slice.length + 5);
+    framed.write((slice.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    framed[4] = 1;
+    slice.copy(framed, 5);
+    chunks.push(framed);
   }
   return chunks;
 }
@@ -736,9 +741,9 @@ function sidebandChunks(pack: Buffer): Buffer[] {
 // HTTP plumbing
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  const buf = body === undefined ? Buffer.alloc(0) : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, ...headers });
+  res.end(buf);
 }
 
 function sendJsonText(res: ServerResponse, status: number, text: string, bytes?: number): void {
@@ -752,6 +757,10 @@ function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentTy
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  // No Content-Length and no Transfer-Encoding means the request carries no body by definition.
+  if (req.headers['content-length'] === '0' || (req.headers['content-length'] === undefined && req.headers['transfer-encoding'] === undefined)) {
+    return Promise.resolve(Buffer.alloc(0));
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -769,16 +778,22 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/** The trial token is fixed by the environment before the server boots; read it once, not per request. */
+let cachedToken: string | null = null;
+let cachedAuthHeader: string | null = null;
+
 function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (cachedToken === null) cachedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return cachedToken;
 }
 
 /** Bearer auth against the trial token; an unset token (local dev only) accepts everything. */
 function authorized(req: IncomingMessage): boolean {
   const token = expectedToken();
   if (token === '') return true;
+  if (cachedAuthHeader === null) cachedAuthHeader = `Bearer ${token}`;
   const header = req.headers['authorization'];
-  return typeof header === 'string' && header === `Bearer ${token}`;
+  return typeof header === 'string' && header === cachedAuthHeader;
 }
 
 function hasAnyAuth(req: IncomingMessage): boolean {
@@ -1972,7 +1987,10 @@ function fetchResponse(repo: Repo, wants: string[], haves: string[], depth: numb
 
 function handleUploadPack(res: ServerResponse, repo: Repo, rawBody: Buffer): void {
   const { packets } = parsePackets(rawBody);
-  const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => packet.payload.toString('utf8').replace(/\n$/, ''));
+  const lines: string[] = [];
+  for (const packet of packets) {
+    if (packet.kind === 'data') lines.push(packet.payload.toString('utf8').replace(/\n$/, ''));
+  }
   const first = lines[0] ?? '';
 
   if (first.startsWith('command=ls-refs')) {
@@ -2034,7 +2052,10 @@ interface PushCommand {
 
 function handleReceivePack(res: ServerResponse, repo: Repo, rawBody: Buffer): void {
   const { packets, rest } = parsePackets(rawBody);
-  const dataLines = packets.filter((packet) => packet.kind === 'data').map((packet) => packet.payload.toString('utf8').replace(/\n$/, ''));
+  const dataLines: string[] = [];
+  for (const packet of packets) {
+    if (packet.kind === 'data') dataLines.push(packet.payload.toString('utf8').replace(/\n$/, ''));
+  }
   if (dataLines.length === 0 && rest.length === 0) throw new HttpError(400, 'Empty push');
   const commands: PushCommand[] = [];
   let capabilities = '';
@@ -2105,14 +2126,7 @@ function handleReceivePack(res: ServerResponse, repo: Repo, rawBody: Buffer): vo
 
   const reportStream = Buffer.concat(report.map((line) => pktLine(line)));
   if (sideband) {
-    const framed: Buffer[] = [];
-    let offset = 0;
-    const SIZE = 65512;
-    while (offset < reportStream.length) {
-      const slice = reportStream.subarray(offset, Math.min(reportStream.length, offset + SIZE));
-      framed.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
-      offset += SIZE;
-    }
+    const framed = sidebandChunks(reportStream);
     framed.push(PKT_FLUSH);
     sendBuffer(res, 200, Buffer.concat(framed), 'application/x-git-receive-pack-result');
   } else {
@@ -4140,7 +4154,9 @@ export function createApp(): Server {
         const url = new URL(req.url ?? '/', 'http://entry');
         let path = url.pathname;
         if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
-        const segments = path.split('/').filter((segment) => segment !== '').map(decodeSegment);
+        const rawSegments = path.split('/').filter((segment) => segment !== '');
+        // decodeURIComponent is the identity on '%'-free segments; only pay for it when one appears.
+        const segments = path.includes('%') ? rawSegments.map(decodeSegment) : rawSegments;
         const method = req.method ?? 'GET';
 
         if (method === 'GET' && path === '/healthz') {
